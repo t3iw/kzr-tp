@@ -1,0 +1,493 @@
+repeat task.wait() until game:IsLoaded()
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local SoundService     = game:GetService("SoundService")
+local Player           = Players.LocalPlayer
+
+-- ================================================
+-- CONFIG
+-- ================================================
+local Enabled = {
+    TPRight = false,
+    TPLeft  = false,
+}
+
+-- Une seule destination par côté
+local TP_RIGHT = Vector3.new(-476.16, -6.52, 25.62)
+local TP_LEFT  = Vector3.new(-476.48, -6.28, 92.73)
+
+local TP_COOLDOWN  = 0.5
+local tpOnCooldown = false
+
+-- ================================================
+-- ANTI RAGDOLL — actif dès le début, permanent
+-- Remet debout + réactive les joints + permet de marcher immédiatement
+-- ================================================
+local function applyAntiRagdoll(char)
+    if not char then return end
+    local hum  = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+
+    if hum then
+        local st = hum:GetState()
+        if st == Enum.HumanoidStateType.Physics
+        or st == Enum.HumanoidStateType.Ragdoll
+        or st == Enum.HumanoidStateType.FallingDown
+        or st == Enum.HumanoidStateType.GettingUp then
+            -- Force l'état Running pour pouvoir marcher immédiatement
+            hum:ChangeState(Enum.HumanoidStateType.Running)
+            -- Reassigne le sujet caméra
+            workspace.CurrentCamera.CameraSubject = hum
+            -- Stoppe toute vélocité résiduelle
+            if root then
+                root.AssemblyLinearVelocity  = Vector3.zero
+                root.AssemblyAngularVelocity = Vector3.zero
+            end
+        end
+        -- Annule l'attribut ragdoll si le jeu en utilise un
+        pcall(function()
+            if char:GetAttribute("Ragdoll")    ~= nil then char:SetAttribute("Ragdoll",    false) end
+            if char:GetAttribute("ragdolled")  ~= nil then char:SetAttribute("ragdolled",  false) end
+            if char:GetAttribute("Ragdolled")  ~= nil then char:SetAttribute("Ragdolled",  false) end
+            if char:GetAttribute("IsRagdoll")  ~= nil then char:SetAttribute("IsRagdoll",  false) end
+        end)
+        -- Réactive tous les Motor6D (joints du squelette)
+        for _, obj in ipairs(char:GetDescendants()) do
+            if obj:IsA("Motor6D") and not obj.Enabled then
+                obj.Enabled = true
+            end
+        end
+        -- Réactive les contrôles joueur si désactivés
+        pcall(function()
+            local pm = Player.PlayerScripts:FindFirstChild("PlayerModule")
+            if pm then
+                local ctrl = require(pm:FindFirstChild("ControlModule"))
+                if ctrl then ctrl:Enable() end
+            end
+        end)
+    end
+end
+
+-- Loop Heartbeat permanente anti ragdoll
+RunService.Heartbeat:Connect(function()
+    applyAntiRagdoll(Player.Character)
+end)
+
+-- ================================================
+-- TÉLÉPORTATION — effet "marche jusqu'au point"
+-- On TP directement à la destination finale mais on
+-- utilise un BodyPosition smooth pour simuler un
+-- glissement rapide vers la cible (vitesse réglable)
+-- ================================================
+local TP_WALK_SPEED = 120  -- studs/s (plus élevé = plus rapide/instantané)
+
+local function doSmoothTP(targetPos)
+    local char = Player.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then return end
+
+    -- Calcule la durée en fonction de la distance
+    local dist     = (Vector3.new(targetPos.X, hrp.Position.Y, targetPos.Z) - hrp.Position).Magnitude
+    local duration = math.clamp(dist / TP_WALK_SPEED, 0.05, 0.25)
+
+    -- Désactive les contrôles pendant le déplacement
+    hum.WalkSpeed = 0
+
+    -- AlignPosition pour un mouvement lisse côté physique
+    local att0 = Instance.new("Attachment", hrp)
+    local ap   = Instance.new("AlignPosition", hrp)
+    ap.Attachment0       = att0
+    ap.Position          = Vector3.new(targetPos.X, hrp.Position.Y, targetPos.Z)
+    ap.MaxForce          = 1e6
+    ap.MaxVelocity       = TP_WALK_SPEED
+    ap.Responsiveness    = 200
+    ap.ApplyAtCenterOfMass = true
+    ap.RigidityEnabled   = false
+
+    -- Oriente le perso vers la destination
+    local dir = Vector3.new(targetPos.X - hrp.Position.X, 0, targetPos.Z - hrp.Position.Z)
+    if dir.Magnitude > 0.5 then
+        hrp.CFrame = CFrame.new(hrp.Position, hrp.Position + dir.Unit)
+    end
+
+    -- Attend la fin du glissement
+    task.delay(duration, function()
+        -- Nettoie
+        ap:Destroy()
+        att0:Destroy()
+
+        -- TP précis sur la position finale (corrige Y aussi)
+        local c2 = Player.Character
+        if not c2 then return end
+        local h2 = c2:FindFirstChild("HumanoidRootPart")
+        local hum2 = c2:FindFirstChildOfClass("Humanoid")
+        if h2 then
+            h2.CFrame = CFrame.new(targetPos)
+            h2.AssemblyLinearVelocity = Vector3.zero
+        end
+        -- Rend le contrôle au joueur
+        if hum2 then
+            hum2.WalkSpeed = 16
+            hum2:ChangeState(Enum.HumanoidStateType.Running)
+        end
+    end)
+end
+
+-- ================================================
+-- DÉCLENCHEUR TP
+-- ================================================
+local function triggerTP()
+    if tpOnCooldown then return end
+    if not Enabled.TPRight and not Enabled.TPLeft then return end
+    tpOnCooldown = true
+
+    if Enabled.TPRight then
+        doSmoothTP(TP_RIGHT)
+    else
+        doSmoothTP(TP_LEFT)
+    end
+
+    task.delay(TP_COOLDOWN, function()
+        tpOnCooldown = false
+    end)
+end
+
+-- ================================================
+-- DÉTECTION RAGDOLL — 4 méthodes combinées
+-- ================================================
+local wasRagdolled = false
+local motorWasOff  = false
+
+local function setupRagdollDetection(char)
+    if not char then return end
+    local hum = char:WaitForChild("Humanoid", 5)
+    if not hum then return end
+
+    wasRagdolled = false
+    motorWasOff  = false
+
+    -- Méthode 1 : StateChanged
+    hum.StateChanged:Connect(function(_, newState)
+        if newState == Enum.HumanoidStateType.Physics
+        or newState == Enum.HumanoidStateType.Ragdoll
+        or newState == Enum.HumanoidStateType.FallingDown then
+            if not wasRagdolled then
+                wasRagdolled = true
+                triggerTP()
+            end
+        else
+            wasRagdolled = false
+        end
+    end)
+
+    -- Méthode 2 : Motor6D désactivé
+    local function watchMotor(motor)
+        if not motor:IsA("Motor6D") then return end
+        motor:GetPropertyChangedSignal("Enabled"):Connect(function()
+            if not motor.Enabled then
+                if not motorWasOff then
+                    motorWasOff = true
+                    triggerTP()
+                end
+            else
+                motorWasOff = false
+            end
+        end)
+    end
+    for _, d in ipairs(char:GetDescendants()) do watchMotor(d) end
+    char.DescendantAdded:Connect(function(d) task.defer(function() watchMotor(d) end) end)
+
+    -- Méthode 3 : Attribut ragdoll
+    char.AttributeChanged:Connect(function(attr)
+        if attr == "Ragdoll" or attr == "ragdolled" or attr == "Ragdolled" or attr == "IsRagdoll" then
+            local v = char:GetAttribute(attr)
+            if v == true then triggerTP() end
+        end
+    end)
+
+    -- Méthode 4 : Heartbeat polling backup
+    RunService.Heartbeat:Connect(function()
+        if not hum or not hum.Parent then return end
+        local st = hum:GetState()
+        local isRag = st == Enum.HumanoidStateType.Physics
+                   or st == Enum.HumanoidStateType.Ragdoll
+                   or st == Enum.HumanoidStateType.FallingDown
+        if isRag and not wasRagdolled then
+            wasRagdolled = true
+            triggerTP()
+        elseif not isRag then
+            wasRagdolled = false
+        end
+    end)
+end
+
+-- Init
+Player.CharacterAdded:Connect(function(char)
+    tpOnCooldown = false
+    task.wait(0.3)
+    setupRagdollDetection(char)
+end)
+if Player.Character then
+    task.spawn(setupRagdollDetection, Player.Character)
+end
+
+-- ================================================
+-- GUI
+-- ================================================
+local C = {
+    bg          = Color3.fromRGB(2,   2,   4),
+    purple      = Color3.fromRGB(178, 48,  255),
+    purpleLight = Color3.fromRGB(200, 100, 255),
+    text        = Color3.fromRGB(255, 255, 255),
+    textDim     = Color3.fromRGB(200, 100, 255),
+    danger      = Color3.fromRGB(239, 68,  68),
+    off         = Color3.fromRGB(25,  20,  35),
+    tpRight     = Color3.fromRGB(100, 220, 180),
+    tpLeft      = Color3.fromRGB(100, 150, 255),
+}
+
+local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+local gs = isMobile and 0.72 or 1
+
+local oldGui = Player.PlayerGui:FindFirstChild("KZR_TP")
+if oldGui then oldGui:Destroy() end
+
+local sg = Instance.new("ScreenGui")
+sg.Name           = "KZR_TP"
+sg.ResetOnSpawn   = false
+sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sg.Parent         = Player.PlayerGui
+
+-- Fenêtre
+local main = Instance.new("Frame", sg)
+main.Name             = "Main"
+main.Size             = UDim2.new(0, 270*gs, 0, 178*gs)
+main.Position         = UDim2.new(1, -292*gs, 0, 20*gs)
+main.BackgroundColor3 = C.bg
+main.BorderSizePixel  = 0
+main.Active           = true
+main.Draggable        = true
+main.ClipsDescendants = true
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 16*gs)
+
+-- Bordure tournante
+local mainStroke = Instance.new("UIStroke", main)
+mainStroke.Thickness = 2
+local strokeGrad = Instance.new("UIGradient", mainStroke)
+strokeGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,   Color3.fromRGB(200,100,255)),
+    ColorSequenceKeypoint.new(0.2, Color3.fromRGB(0,0,0)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(178,48,255)),
+    ColorSequenceKeypoint.new(0.8, Color3.fromRGB(0,0,0)),
+    ColorSequenceKeypoint.new(1,   Color3.fromRGB(200,100,255)),
+})
+task.spawn(function()
+    local r = 0
+    while main.Parent do
+        r = (r + 3) % 360
+        strokeGrad.Rotation = r
+        task.wait(0.02)
+    end
+end)
+
+-- Particules
+for i = 1, 35 do
+    local ball = Instance.new("Frame", main)
+    ball.Size = UDim2.new(0, math.random(2,4), 0, math.random(2,4))
+    ball.Position = UDim2.new(math.random(2,98)/100, 0, math.random(2,98)/100, 0)
+    ball.BackgroundColor3 = Color3.fromRGB(200,100,255)
+    ball.BackgroundTransparency = math.random(15,45)/100
+    ball.BorderSizePixel = 0
+    ball.ZIndex = 1
+    Instance.new("UICorner", ball).CornerRadius = UDim.new(1,0)
+    task.spawn(function()
+        local sx = ball.Position.X.Scale
+        local sy = ball.Position.Y.Scale
+        local ph = math.random() * math.pi * 2
+        local sp = 0.25 + math.random() * 0.45
+        while ball.Parent do
+            local t = tick() + ph
+            ball.Position = UDim2.new(
+                math.clamp(sx + math.sin(t*sp)*0.025, 0.01, 0.99), 0,
+                math.clamp(sy + math.cos(t*sp*0.8)*0.02, 0.01, 0.99), 0
+            )
+            ball.BackgroundTransparency = 0.2 + math.sin(t*1.5+ph)*0.25
+            task.wait(0.03)
+        end
+    end)
+end
+
+-- Header
+local header = Instance.new("Frame", main)
+header.Size = UDim2.new(1, 0, 0, 54*gs)
+header.BackgroundTransparency = 1
+header.ZIndex = 2
+
+local titleLbl = Instance.new("TextLabel", header)
+titleLbl.Size = UDim2.new(1, -50*gs, 0, 28*gs)
+titleLbl.Position = UDim2.new(0, 14*gs, 0, 8*gs)
+titleLbl.BackgroundTransparency = 1
+titleLbl.Text = "KZR TP"
+titleLbl.TextColor3 = C.text
+titleLbl.Font = Enum.Font.GothamBlack
+titleLbl.TextSize = 20*gs
+titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+titleLbl.ZIndex = 5
+
+local subLbl = Instance.new("TextLabel", header)
+subLbl.Size = UDim2.new(1, -50*gs, 0, 18*gs)
+subLbl.Position = UDim2.new(0, 14*gs, 0, 34*gs)
+subLbl.BackgroundTransparency = 1
+subLbl.Text = "discord.gg/kzr"
+subLbl.TextColor3 = C.purpleLight
+subLbl.Font = Enum.Font.GothamBold
+subLbl.TextSize = 11*gs
+subLbl.TextXAlignment = Enum.TextXAlignment.Left
+subLbl.ZIndex = 5
+
+local closeBtn = Instance.new("TextButton", header)
+closeBtn.Size = UDim2.new(0, 36*gs, 0, 36*gs)
+closeBtn.Position = UDim2.new(1, -46*gs, 0.5, -18*gs)
+closeBtn.BackgroundTransparency = 1
+closeBtn.Text = "x"
+closeBtn.TextColor3 = C.textDim
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 24*gs
+closeBtn.ZIndex = 8
+
+local guiVisible = true
+closeBtn.MouseButton1Click:Connect(function()
+    guiVisible = false ; main.Visible = false
+end)
+closeBtn.MouseEnter:Connect(function() closeBtn.TextColor3 = C.danger end)
+closeBtn.MouseLeave:Connect(function() closeBtn.TextColor3 = C.textDim end)
+
+local divider = Instance.new("Frame", main)
+divider.Size = UDim2.new(0.9, 0, 0, 1)
+divider.Position = UDim2.new(0.05, 0, 0, 54*gs)
+divider.BackgroundColor3 = Color3.fromRGB(80,20,120)
+divider.BorderSizePixel = 0
+divider.ZIndex = 3
+
+-- Toggle factory
+local VisualSetters = {}
+
+local function createToggle(parent, yPos, labelText, enabledKey, callback, onColor)
+    onColor = onColor or C.purple
+    local row = Instance.new("Frame", parent)
+    row.Size     = UDim2.new(1, -16*gs, 0, 48*gs)
+    row.Position = UDim2.new(0, 8*gs, 0, yPos*gs)
+    row.BackgroundTransparency = 1
+    row.ZIndex = 3
+
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size = UDim2.new(0.65, 0, 1, 0)
+    lbl.Position = UDim2.new(0, 8*gs, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = labelText
+    lbl.TextColor3 = C.text
+    lbl.Font = Enum.Font.GothamSemibold
+    lbl.TextSize = 14*gs
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.ZIndex = 4
+
+    local defaultOn = Enabled[enabledKey]
+    local toggleBg = Instance.new("Frame", row)
+    toggleBg.Size = UDim2.new(0, 50*gs, 0, 26*gs)
+    toggleBg.Position = UDim2.new(1, -56*gs, 0.5, -13*gs)
+    toggleBg.BackgroundColor3 = defaultOn and onColor or C.off
+    toggleBg.ZIndex = 4
+    Instance.new("UICorner", toggleBg).CornerRadius = UDim.new(1,0)
+
+    local circle = Instance.new("Frame", toggleBg)
+    circle.Size = UDim2.new(0, 20*gs, 0, 20*gs)
+    circle.Position = defaultOn
+        and UDim2.new(1, -23*gs, 0.5, -10*gs)
+        or  UDim2.new(0,   3*gs, 0.5, -10*gs)
+    circle.BackgroundColor3 = Color3.new(1,1,1)
+    circle.ZIndex = 5
+    Instance.new("UICorner", circle).CornerRadius = UDim.new(1,0)
+
+    local clickBtn = Instance.new("TextButton", row)
+    clickBtn.Size = UDim2.new(1, 0, 1, 0)
+    clickBtn.BackgroundTransparency = 1
+    clickBtn.Text = ""
+    clickBtn.ZIndex = 7
+
+    local isOn = defaultOn
+    local function setVisual(state, skipCb)
+        isOn = state
+        TweenService:Create(toggleBg, TweenInfo.new(0.25), {
+            BackgroundColor3 = isOn and onColor or C.off
+        }):Play()
+        TweenService:Create(circle, TweenInfo.new(0.25, Enum.EasingStyle.Back), {
+            Position = isOn
+                and UDim2.new(1, -23*gs, 0.5, -10*gs)
+                or  UDim2.new(0,   3*gs, 0.5, -10*gs)
+        }):Play()
+        if not skipCb then callback(isOn) end
+    end
+    VisualSetters[enabledKey] = setVisual
+
+    clickBtn.MouseButton1Click:Connect(function()
+        isOn = not isOn
+        Enabled[enabledKey] = isOn
+        setVisual(isOn)
+        pcall(function()
+            local s = Instance.new("Sound", SoundService)
+            s.SoundId = "rbxassetid://6895079813"
+            s.Volume = 0.4 ; s:Play()
+            game:GetService("Debris"):AddItem(s, 1)
+        end)
+    end)
+
+    return setVisual
+end
+
+local content = Instance.new("Frame", main)
+content.Size = UDim2.new(1, 0, 1, -60*gs)
+content.Position = UDim2.new(0, 0, 0, 60*gs)
+content.BackgroundTransparency = 1
+content.ZIndex = 2
+
+-- Seulement 2 toggles : TP RIGHT et TP LEFT
+createToggle(content, 2,  "TP RIGHT", "TPRight", function(s)
+    Enabled.TPRight = s
+    if s and Enabled.TPLeft then
+        Enabled.TPLeft = false
+        if VisualSetters.TPLeft then VisualSetters.TPLeft(false, true) end
+    end
+end, C.purple)
+
+createToggle(content, 54, "TP LEFT",  "TPLeft",  function(s)
+    Enabled.TPLeft = s
+    if s and Enabled.TPRight then
+        Enabled.TPRight = false
+        if VisualSetters.TPRight then VisualSetters.TPRight(false, true) end
+    end
+end, C.purple)
+
+local infoLbl = Instance.new("TextLabel", content)
+infoLbl.Size = UDim2.new(1, 0, 0, 24*gs)
+infoLbl.Position = UDim2.new(0, 0, 0, 114*gs)
+infoLbl.BackgroundTransparency = 1
+infoLbl.Text = "ALT = OUVRIR / FERMER  •  Anti Ragdoll ON"
+infoLbl.TextColor3 = C.textDim
+infoLbl.Font = Enum.Font.Gotham
+infoLbl.TextSize = 9*gs
+infoLbl.ZIndex = 3
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.LeftControl then
+        guiVisible = not guiVisible
+        main.Visible = guiVisible
+    end
+end)
+
+print("[KZR TP] Chargé — Anti Ragdoll permanent — ALT pour le menu")
